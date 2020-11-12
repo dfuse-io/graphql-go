@@ -209,7 +209,7 @@ func (s *Schema) exec(ctx context.Context, queryString string, operationName str
 
 	// Subscriptions are not valid in Exec. Use schema.Subscribe() instead.
 	if op.Type == query.Subscription {
-		return &Response{Errors: []*errors.QueryError{&errors.QueryError{Message: "graphql-ws protocol header is missing"}}}
+		return &Response{Errors: []*errors.QueryError{{Message: "graphql-ws protocol header is missing"}}}
 	}
 	if op.Type == query.Mutation {
 		if _, ok := s.schema.EntryPoints["mutation"]; !ok {
