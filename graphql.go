@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"strings"
 	"time"
 
 	"github.com/graph-gophers/graphql-go/errors"
@@ -243,7 +244,8 @@ func (s *Schema) exec(ctx context.Context, queryString string, operationName str
 		}
 		varTypes[v.Name.Name] = introspection.WrapType(t)
 	}
-	traceCtx, finish := s.tracer.TraceQuery(ctx, queryString, operationName, variables, varTypes)
+
+	traceCtx, finish := s.tracer.TraceRequest(ctx, queryString, strings.ToLower(string(op.Type)), operationName, variables, varTypes)
 	data, errs := r.Execute(traceCtx, res, op)
 	finish(errs)
 

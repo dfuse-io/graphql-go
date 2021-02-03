@@ -6,23 +6,35 @@ import (
 
 	"github.com/graph-gophers/graphql-go/errors"
 	"github.com/graph-gophers/graphql-go/introspection"
+	"github.com/graph-gophers/graphql-go/selected"
 	opentracing "github.com/opentracing/opentracing-go"
 	"github.com/opentracing/opentracing-go/ext"
 	"github.com/opentracing/opentracing-go/log"
 )
 
-type TraceQueryFinishFunc func([]*errors.QueryError)
+// Ensure our own types respects the interface
+var _ Tracer = OpenTracingTracer{}
+var _ Tracer = NoopTracer{}
+
+type TraceRequestFinishFunc func([]*errors.QueryError)
+type TraceOperationFinishFunc func()
 type TraceFieldFinishFunc func(*errors.QueryError)
 
 type Tracer interface {
-	TraceQuery(ctx context.Context, queryString string, operationName string, variables map[string]interface{}, varTypes map[string]*introspection.Type) (context.Context, TraceQueryFinishFunc)
+	TraceRequest(ctx context.Context, queryString string, opType string, operationName string, variables map[string]interface{}, varTypes map[string]*introspection.Type) (context.Context, TraceRequestFinishFunc)
+
+	TraceQuery(ctx context.Context, root selected.Field) (context.Context, TraceOperationFinishFunc)
+	TraceMutation(ctx context.Context, root selected.Field) (context.Context, TraceOperationFinishFunc)
+	TraceSubscription(ctx context.Context, root selected.Field) (context.Context, TraceOperationFinishFunc)
+
 	TraceField(ctx context.Context, label, typeName, fieldName string, trivial bool, args map[string]interface{}) (context.Context, TraceFieldFinishFunc)
 }
 
 type OpenTracingTracer struct{}
 
-func (OpenTracingTracer) TraceQuery(ctx context.Context, queryString string, operationName string, variables map[string]interface{}, varTypes map[string]*introspection.Type) (context.Context, TraceQueryFinishFunc) {
+func (OpenTracingTracer) TraceRequest(ctx context.Context, queryString string, opType string, operationName string, variables map[string]interface{}, varTypes map[string]*introspection.Type) (context.Context, TraceRequestFinishFunc) {
 	span, spanCtx := opentracing.StartSpanFromContext(ctx, "GraphQL request")
+	span.SetTag("graphql.type", opType)
 	span.SetTag("graphql.query", queryString)
 
 	if operationName != "" {
@@ -42,6 +54,33 @@ func (OpenTracingTracer) TraceQuery(ctx context.Context, queryString string, ope
 			ext.Error.Set(span, true)
 			span.SetTag("graphql.error", msg)
 		}
+		span.Finish()
+	}
+}
+
+func (OpenTracingTracer) TraceQuery(ctx context.Context, root selected.Field) (context.Context, TraceOperationFinishFunc) {
+	span, spanCtx := opentracing.StartSpanFromContext(ctx, "GraphQL Query")
+	span.SetTag("graphql.type", root.Identifier())
+
+	return spanCtx, func() {
+		span.Finish()
+	}
+}
+
+func (OpenTracingTracer) TraceMutation(ctx context.Context, root selected.Field) (context.Context, TraceOperationFinishFunc) {
+	span, spanCtx := opentracing.StartSpanFromContext(ctx, "GraphQL Mutation")
+	span.SetTag("graphql.type", root.Identifier())
+
+	return spanCtx, func() {
+		span.Finish()
+	}
+}
+
+func (OpenTracingTracer) TraceSubscription(ctx context.Context, root selected.Field) (context.Context, TraceOperationFinishFunc) {
+	span, spanCtx := opentracing.StartSpanFromContext(ctx, "GraphQL Subscription")
+	span.SetTag("graphql.type", root.Identifier())
+
+	return spanCtx, func() {
 		span.Finish()
 	}
 }
@@ -71,8 +110,20 @@ func noop(*errors.QueryError) {}
 
 type NoopTracer struct{}
 
-func (NoopTracer) TraceQuery(ctx context.Context, queryString string, operationName string, variables map[string]interface{}, varTypes map[string]*introspection.Type) (context.Context, TraceQueryFinishFunc) {
+func (NoopTracer) TraceRequest(ctx context.Context, queryString string, opType string, operationName string, variables map[string]interface{}, varTypes map[string]*introspection.Type) (context.Context, TraceRequestFinishFunc) {
 	return ctx, func(errs []*errors.QueryError) {}
+}
+
+func (NoopTracer) TraceQuery(ctx context.Context, root selected.Field) (context.Context, TraceOperationFinishFunc) {
+	return ctx, func() {}
+}
+
+func (NoopTracer) TraceMutation(ctx context.Context, root selected.Field) (context.Context, TraceOperationFinishFunc) {
+	return ctx, func() {}
+}
+
+func (NoopTracer) TraceSubscription(ctx context.Context, root selected.Field) (context.Context, TraceOperationFinishFunc) {
+	return ctx, func() {}
 }
 
 func (NoopTracer) TraceField(ctx context.Context, label, typeName, fieldName string, trivial bool, args map[string]interface{}) (context.Context, TraceFieldFinishFunc) {

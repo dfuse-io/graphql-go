@@ -14,6 +14,9 @@ import (
 	"github.com/graph-gophers/graphql-go/internal/exec/resolvable"
 	"github.com/graph-gophers/graphql-go/internal/exec/selected"
 	"github.com/graph-gophers/graphql-go/internal/query"
+	"github.com/graph-gophers/graphql-go/introspection"
+	selectedPublic "github.com/graph-gophers/graphql-go/selected"
+	"github.com/graph-gophers/graphql-go/trace"
 )
 
 type Response struct {
@@ -21,10 +24,12 @@ type Response struct {
 	Errors []*errors.QueryError
 }
 
-func (r *Request) Subscribe(ctx context.Context, s *resolvable.Schema, op *query.Operation) <-chan *Response {
+func (r *Request) Subscribe(ctx context.Context, queryString string, s *resolvable.Schema, op *query.Operation, varTypes map[string]*introspection.Type) <-chan *Response {
 	var result reflect.Value
 	var f *fieldToExec
 	var err *errors.QueryError
+	var finishSubscriptionTrace trace.TraceOperationFinishFunc
+
 	func() {
 		defer r.handlePanic(ctx)
 
@@ -39,13 +44,17 @@ func (r *Request) Subscribe(ctx context.Context, s *resolvable.Schema, op *query
 		}
 		f = fields[0]
 
+		var traceCtx context.Context
+		traceCtx, finishSubscriptionTrace = r.Tracer.TraceSubscription(ctx, f.field.ToSelection().(selectedPublic.Field))
+
 		var in []reflect.Value
 		if f.field.HasContext {
-			in = append(in, reflect.ValueOf(gcontext.WithGraphQLContext(ctx, f.field)))
+			in = append(in, reflect.ValueOf(gcontext.WithGraphQLContext(traceCtx, f.field)))
 		}
 		if f.field.ArgsPacker != nil {
 			in = append(in, f.field.PackedArgs)
 		}
+
 		callOut := f.resolver.Method(f.field.MethodIndex).Call(in)
 		result = callOut[0]
 
@@ -64,22 +73,22 @@ func (r *Request) Subscribe(ctx context.Context, s *resolvable.Schema, op *query
 
 	// Handles the case where the locally executed func above panicked
 	if len(r.Request.Errs) > 0 {
-		return sendAndReturnClosed(&Response{Errors: r.Request.Errs})
+		return sendAndReturnClosed(&Response{Errors: r.Request.Errs}, finishSubscriptionTrace)
 	}
 
 	if f == nil {
-		return sendAndReturnClosed(&Response{Errors: []*errors.QueryError{err}})
+		return sendAndReturnClosed(&Response{Errors: []*errors.QueryError{err}}, finishSubscriptionTrace)
 	}
 
 	if err != nil {
 		if _, nonNullChild := f.field.Type.(*common.NonNull); nonNullChild {
-			return sendAndReturnClosed(&Response{Errors: []*errors.QueryError{err}})
+			return sendAndReturnClosed(&Response{Errors: []*errors.QueryError{err}}, finishSubscriptionTrace)
 		}
-		return sendAndReturnClosed(&Response{Data: []byte(fmt.Sprintf(`{"%s":null}`, f.field.Alias)), Errors: []*errors.QueryError{err}})
+		return sendAndReturnClosed(&Response{Data: []byte(fmt.Sprintf(`{"%s":null}`, f.field.Alias)), Errors: []*errors.QueryError{err}}, finishSubscriptionTrace)
 	}
 
 	if ctxErr := ctx.Err(); ctxErr != nil {
-		return sendAndReturnClosed(&Response{Errors: []*errors.QueryError{errors.Errorf("%s", ctxErr)}})
+		return sendAndReturnClosed(&Response{Errors: []*errors.QueryError{errors.Errorf("%s", ctxErr)}}, finishSubscriptionTrace)
 	}
 
 	c := make(chan *Response)
@@ -90,6 +99,12 @@ func (r *Request) Subscribe(ctx context.Context, s *resolvable.Schema, op *query
 	}
 
 	go func() {
+		defer func() {
+			if finishSubscriptionTrace != nil {
+				finishSubscriptionTrace()
+			}
+		}()
+
 		for {
 			// Check subscription context
 			chosen, resp, ok := reflect.Select([]reflect.SelectCase{
@@ -140,7 +155,7 @@ func (r *Request) Subscribe(ctx context.Context, s *resolvable.Schema, op *query
 						defer subR.handlePanic(subCtx)
 
 						var buf bytes.Buffer
-						subR.execSelectionSet(subCtx, f.sels, f.field.Type, &pathSegment{nil, f.field.Alias}, s, resp, &buf)
+						subR.execSelectionSet(subCtx, op, f.sels, f.field.Type, &pathSegment{nil, f.field.Alias}, s, resp, &buf)
 
 						propagateChildError := false
 						if _, nonNullChild := f.field.Type.(*common.NonNull); nonNullChild && resolvedToNull(&buf) {
@@ -173,9 +188,13 @@ func (r *Request) Subscribe(ctx context.Context, s *resolvable.Schema, op *query
 	return c
 }
 
-func sendAndReturnClosed(resp *Response) chan *Response {
+func sendAndReturnClosed(resp *Response, finishTrace trace.TraceOperationFinishFunc) chan *Response {
 	c := make(chan *Response, 1)
 	c <- resp
 	close(c)
+	if finishTrace != nil {
+		finishTrace()
+	}
+
 	return c
 }

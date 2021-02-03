@@ -17,6 +17,7 @@ import (
 	"github.com/graph-gophers/graphql-go/internal/query"
 	"github.com/graph-gophers/graphql-go/internal/schema"
 	"github.com/graph-gophers/graphql-go/log"
+	selectedPublic "github.com/graph-gophers/graphql-go/selected"
 	"github.com/graph-gophers/graphql-go/trace"
 )
 
@@ -48,7 +49,7 @@ func (r *Request) Execute(ctx context.Context, s *resolvable.Schema, op *query.O
 	func() {
 		defer r.handlePanic(ctx)
 		sels := selected.ApplyOperation(&r.Request, s, op)
-		r.execSelections(ctx, sels, nil, s, s.Resolver, &out, op.Type == query.Mutation)
+		r.execSelections(ctx, op, sels, nil, s, s.Resolver, &out, op.Type == query.Mutation)
 	}()
 
 	if err := ctx.Err(); err != nil {
@@ -69,7 +70,7 @@ func resolvedToNull(b *bytes.Buffer) bool {
 	return bytes.Equal(b.Bytes(), []byte("null"))
 }
 
-func (r *Request) execSelections(ctx context.Context, sels []selected.Selection, path *pathSegment, s *resolvable.Schema, resolver reflect.Value, out *bytes.Buffer, serially bool) {
+func (r *Request) execSelections(ctx context.Context, op *query.Operation, sels []selected.Selection, path *pathSegment, s *resolvable.Schema, resolver reflect.Value, out *bytes.Buffer, serially bool) {
 	async := !serially && selected.HasAsyncSel(sels)
 
 	var fields []*fieldToExec
@@ -80,17 +81,25 @@ func (r *Request) execSelections(ctx context.Context, sels []selected.Selection,
 		wg.Add(len(fields))
 		for _, f := range fields {
 			go func(f *fieldToExec) {
-				defer wg.Done()
-				defer r.handlePanic(ctx)
+				traceCtx, finish := r.traceOperation(ctx, op, f.field, path)
+				defer func() {
+					finish()
+					wg.Done()
+				}()
+
+				defer r.handlePanic(traceCtx)
 				f.out = new(bytes.Buffer)
-				execFieldSelection(ctx, r, s, f, &pathSegment{path, f.field.Alias}, true)
+
+				execFieldSelection(ctx, op, r, s, f, &pathSegment{path, f.field.Alias}, true)
 			}(f)
 		}
 		wg.Wait()
 	} else {
 		for _, f := range fields {
+			traceCtx, finish := r.traceOperation(ctx, op, f.field, path)
 			f.out = new(bytes.Buffer)
-			execFieldSelection(ctx, r, s, f, &pathSegment{path, f.field.Alias}, true)
+			execFieldSelection(traceCtx, op, r, s, f, &pathSegment{path, f.field.Alias}, true)
+			finish()
 		}
 	}
 
@@ -163,7 +172,7 @@ func typeOf(tf *selected.TypenameField, resolver reflect.Value) string {
 	return ""
 }
 
-func execFieldSelection(ctx context.Context, r *Request, s *resolvable.Schema, f *fieldToExec, path *pathSegment, applyLimiter bool) {
+func execFieldSelection(ctx context.Context, op *query.Operation, r *Request, s *resolvable.Schema, f *fieldToExec, path *pathSegment, applyLimiter bool) {
 	if applyLimiter {
 		r.Limiter <- struct{}{}
 	}
@@ -171,9 +180,12 @@ func execFieldSelection(ctx context.Context, r *Request, s *resolvable.Schema, f
 	var result reflect.Value
 	var err *errors.QueryError
 
-	traceCtx, finish := r.Tracer.TraceField(ctx, f.field.TraceLabel, f.field.TypeName, f.field.Name, !f.field.Async, f.field.Args)
+	traceCtx := ctx
+	var finishTraceField trace.TraceFieldFinishFunc
 	defer func() {
-		finish(err)
+		if finishTraceField != nil {
+			finishTraceField(err)
+		}
 	}()
 
 	err = func() (err *errors.QueryError) {
@@ -186,13 +198,17 @@ func execFieldSelection(ctx context.Context, r *Request, s *resolvable.Schema, f
 		}()
 
 		if f.field.FixedResult.IsValid() {
+			traceCtx, finishTraceField = r.Tracer.TraceField(ctx, f.field.TraceLabel, f.field.TypeName, f.field.Name, !f.field.Async, f.field.Args)
 			result = f.field.FixedResult
 			return nil
 		}
 
-		if err := traceCtx.Err(); err != nil {
+		if err := ctx.Err(); err != nil {
 			return errors.Errorf("%s", err) // don't execute any more resolvers if context got cancelled
 		}
+
+		gqlContext := gcontext.WithGraphQLContext(ctx, f.field)
+		traceCtx, finishTraceField = r.Tracer.TraceField(gqlContext, f.field.TraceLabel, f.field.TypeName, f.field.Name, !f.field.Async, f.field.Args)
 
 		res := f.resolver
 		if f.field.UseMethodResolver() {
@@ -237,10 +253,10 @@ func execFieldSelection(ctx context.Context, r *Request, s *resolvable.Schema, f
 		return
 	}
 
-	r.execSelectionSet(traceCtx, f.sels, f.field.Type, path, s, result, f.out)
+	r.execSelectionSet(traceCtx, op, f.sels, f.field.Type, path, s, result, f.out)
 }
 
-func (r *Request) execSelectionSet(ctx context.Context, sels []selected.Selection, typ common.Type, path *pathSegment, s *resolvable.Schema, resolver reflect.Value, out *bytes.Buffer) {
+func (r *Request) execSelectionSet(ctx context.Context, op *query.Operation, sels []selected.Selection, typ common.Type, path *pathSegment, s *resolvable.Schema, resolver reflect.Value, out *bytes.Buffer) {
 	t, nonNull := unwrapNonNull(typ)
 
 	// a reflect.Value of a nil interface will show up as an Invalid value
@@ -259,7 +275,7 @@ func (r *Request) execSelectionSet(ctx context.Context, sels []selected.Selectio
 
 	switch t.(type) {
 	case *schema.Object, *schema.Interface, *schema.Union:
-		r.execSelections(ctx, sels, path, s, resolver, out, false)
+		r.execSelections(ctx, op, sels, path, s, resolver, out, false)
 		return
 	}
 
@@ -271,7 +287,7 @@ func (r *Request) execSelectionSet(ctx context.Context, sels []selected.Selectio
 
 	switch t := t.(type) {
 	case *common.List:
-		r.execList(ctx, sels, t, path, s, resolver, out)
+		r.execList(ctx, op, sels, t, path, s, resolver, out)
 
 	case *schema.Scalar:
 		v := resolver.Interface()
@@ -310,7 +326,7 @@ func (r *Request) execSelectionSet(ctx context.Context, sels []selected.Selectio
 	}
 }
 
-func (r *Request) execList(ctx context.Context, sels []selected.Selection, typ *common.List, path *pathSegment, s *resolvable.Schema, resolver reflect.Value, out *bytes.Buffer) {
+func (r *Request) execList(ctx context.Context, op *query.Operation, sels []selected.Selection, typ *common.List, path *pathSegment, s *resolvable.Schema, resolver reflect.Value, out *bytes.Buffer) {
 	l := resolver.Len()
 	entryouts := make([]bytes.Buffer, l)
 
@@ -324,7 +340,7 @@ func (r *Request) execList(ctx context.Context, sels []selected.Selection, typ *
 			go func(i int) {
 				defer func() { <-sem }()
 				defer r.handlePanic(ctx)
-				r.execSelectionSet(ctx, sels, typ.OfType, &pathSegment{path, i}, s, resolver.Index(i), &entryouts[i])
+				r.execSelectionSet(ctx, op, sels, typ.OfType, &pathSegment{path, i}, s, resolver.Index(i), &entryouts[i])
 			}(i)
 		}
 		for i := 0; i < concurrency; i++ {
@@ -332,7 +348,7 @@ func (r *Request) execList(ctx context.Context, sels []selected.Selection, typ *
 		}
 	} else {
 		for i := 0; i < l; i++ {
-			r.execSelectionSet(ctx, sels, typ.OfType, &pathSegment{path, i}, s, resolver.Index(i), &entryouts[i])
+			r.execSelectionSet(ctx, op, sels, typ.OfType, &pathSegment{path, i}, s, resolver.Index(i), &entryouts[i])
 		}
 	}
 
@@ -363,6 +379,25 @@ func unwrapNonNull(t common.Type) (common.Type, bool) {
 	return t, false
 }
 
+func (r *Request) traceOperation(ctx context.Context, op *query.Operation, field *selected.SchemaField, path *pathSegment) (context.Context, trace.TraceOperationFinishFunc) {
+	if !path.isRoot() {
+		return ctx, func() {}
+	}
+
+	var tracer func(context.Context, selectedPublic.Field) (context.Context, trace.TraceOperationFinishFunc)
+
+	switch op.Type {
+	case query.Query:
+		tracer = r.Tracer.TraceQuery
+	case query.Mutation:
+		tracer = r.Tracer.TraceMutation
+	case query.Subscription:
+		tracer = r.Tracer.TraceSubscription
+	}
+
+	return tracer(ctx, field.ToSelection().(selectedPublic.Field))
+}
+
 type pathSegment struct {
 	parent *pathSegment
 	value  interface{}
@@ -373,4 +408,8 @@ func (p *pathSegment) toSlice() []interface{} {
 		return nil
 	}
 	return append(p.parent.toSlice(), p.value)
+}
+
+func (p *pathSegment) isRoot() bool {
+	return p == nil
 }
