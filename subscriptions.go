@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strings"
 
 	qerrors "github.com/graph-gophers/graphql-go/errors"
 	"github.com/graph-gophers/graphql-go/internal/common"
@@ -68,12 +69,15 @@ func (s *Schema) subscribe(ctx context.Context, queryString string, operationNam
 		varTypes[v.Name.Name] = introspection.WrapType(t)
 	}
 
+	traceCtx, finish := s.tracer.TraceRequest(ctx, queryString, strings.ToLower(string(op.Type)), operationName, variables, varTypes)
+
 	if op.Type == query.Query || op.Type == query.Mutation {
-		data, errs := r.Execute(ctx, res, op)
+		data, errs := r.Execute(traceCtx, res, op)
+		finish(errs)
 		return sendAndReturnClosed(&Response{Data: data, Errors: errs})
 	}
 
-	responses := r.Subscribe(ctx, res, op)
+	responses := r.Subscribe(ctx, queryString, res, op, varTypes)
 	c := make(chan interface{})
 	go func() {
 		for resp := range responses {
@@ -86,6 +90,9 @@ func (s *Schema) subscribe(ctx context.Context, queryString string, operationNam
 			}
 		}
 		close(c)
+
+		// TODO: Would it be possible to return list of errors? Maybe only SubscriptionError types?
+		finish(nil)
 	}()
 
 	return c
